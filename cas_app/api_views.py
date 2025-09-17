@@ -2,6 +2,7 @@ from rest_framework import generics, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
+from rest_framework.authtoken.models import Token
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate, login, logout
 from django.utils import timezone
@@ -80,7 +81,7 @@ class ServiceDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ServiceSerializer
     permission_classes = [IsAdminUser]
 
-
+    
 class TicketListView(generics.ListAPIView):
     """List tickets for authenticated user"""
     serializer_class = TicketSerializer
@@ -126,6 +127,9 @@ def api_login(request):
     if user is not None and user.is_active:
         login(request, user)
         
+        # Generate or get existing token for the user
+        token, created = Token.objects.get_or_create(user=user)
+        
         # Log authentication
         AuthenticationLog.objects.create(
             user=user,
@@ -138,6 +142,7 @@ def api_login(request):
         response_data = {
             'success': True,
             'user': UserSerializer(user).data,
+            'token': token.key,
             'message': 'Login successful'
         }
         
