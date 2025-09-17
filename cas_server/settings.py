@@ -191,3 +191,8 @@ LOGGING = {
         },
     },
 }
+
+# JWT Settings
+JWT_SECRET_KEY = 'your-secret-key-change-this-in-production'
+JWT_ACCESS_TOKEN_LIFETIME = 60 * 60  # 1 hour
+JWT_REFRESH_TOKEN_LIFETIME = 7 * 24 * 60 * 60  # 7 days

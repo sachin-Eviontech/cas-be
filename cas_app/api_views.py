@@ -40,6 +40,14 @@ def api_root(request):
             'validate': f'{base_url}auth/validate/',
             'user_info': f'{base_url}auth/user/',
         },
+        'service_token_authentication': {
+            'login': f'{base_url}token/login/',
+            'refresh': f'{base_url}token/refresh/',
+            'logout': f'{base_url}token/logout/',
+            'validate': f'{base_url}token/validate/',
+            'user_info': f'{base_url}token/user/',
+            'user_services': f'{base_url}user/services/',
+        },
         'services': {
             'list_create': f'{base_url}services/',
             'detail': f'{base_url}services/<id>/',
@@ -61,6 +69,7 @@ def api_root(request):
         'endpoints': endpoints,
         'documentation': {
             'authentication': 'POST endpoints for login/logout and ticket validation',
+            'service_token_authentication': 'Service-specific JWT token authentication (recommended)',
             'services': 'CRUD operations for registered services (admin only)',
             'user_data': 'User-specific data endpoints (authenticated users)',
             'admin': 'Administrative endpoints (admin users only)'

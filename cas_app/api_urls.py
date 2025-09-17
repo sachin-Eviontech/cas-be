@@ -1,5 +1,6 @@
 from django.urls import path
 from . import api_views
+from . import token_views
 from . import documentation_views
 
 urlpatterns = [
@@ -11,6 +12,17 @@ urlpatterns = [
     path('auth/logout/', api_views.api_logout, name='api_logout'),
     path('auth/validate/', api_views.api_validate, name='api_validate'),
     path('auth/user/', api_views.api_user_info, name='api_user_info'),
+    
+    # Service-specific token authentication endpoints
+    path('token/login/', token_views.token_login, name='token_login'),
+    path('token/refresh/', token_views.token_refresh, name='token_refresh'),
+    path('token/logout/', token_views.token_logout, name='token_logout'),
+    path('token/validate/', token_views.token_validate, name='token_validate'),
+    path('token/user/', token_views.token_user_info, name='token_user_info'),
+    path('user/services/', token_views.get_user_services, name='get_user_services'),
+    
+    # Convenience endpoints (aliases for common CAS operations)
+    path('validate/', api_views.api_validate, name='api_validate_direct'),
     
     # Service management
     path('services/', api_views.ServiceListCreateView.as_view(), name='api_service_list'),

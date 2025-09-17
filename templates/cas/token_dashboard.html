@@ -1,0 +1,204 @@
+{% extends "base.html" %}
+
+{% block title %}Token Dashboard - CAS Server{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-12">
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <h2>Token Dashboard</h2>
+                <div>
+                    <a href="{% url 'cas:token_logout' %}" class="btn btn-outline-danger">Logout</a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <!-- User Info -->
+        <div class="col-md-4">
+            <div class="card">
+                <div class="card-header">
+                    <h5>User Information</h5>
+                </div>
+                <div class="card-body">
+                    <p><strong>Username:</strong> {{ user.username }}</p>
+                    <p><strong>Email:</strong> {{ user.email }}</p>
+                    <p><strong>Name:</strong> {{ user.first_name }} {{ user.last_name }}</p>
+                    <p><strong>Admin:</strong> {{ user_profile.is_cas_admin|yesno:"Yes,No" }}</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Service Access Info -->
+        <div class="col-md-8">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Service-Specific Authentication</h5>
+                </div>
+                <div class="card-body">
+                    <div class="alert alert-info">
+                        <h6><strong>How It Works:</strong></h6>
+                        <ol>
+                            <li>Each service gets its own unique token</li>
+                            <li>Tokens are generated when you access a service</li>
+                            <li>Click "Access Service" below to get a token for that service</li>
+                            <li>Tokens are automatically included when you're redirected</li>
+                        </ol>
+                    </div>
+
+                    <div class="alert alert-warning">
+                        <strong>Note:</strong> Tokens are service-specific and cannot be used across different services.
+                        Each service validates tokens independently.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row mt-4">
+        <!-- Accessible Services -->
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Your Accessible Services</h5>
+                </div>
+                <div class="card-body">
+                    {% if accessible_services %}
+                    <div class="table-responsive">
+                        <table class="table table-striped">
+                            <thead>
+                                <tr>
+                                    <th>Service Name</th>
+                                    <th>URL</th>
+                                    <th>Access Type</th>
+                                    <th>Method</th>
+                                    <th>Granted</th>
+                                    <th>Expires</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for service_info in accessible_services %}
+                                <tr>
+                                    <td>{{ service_info.service.name }}</td>
+                                    <td>
+                                        <a href="{{ service_info.service.url }}" target="_blank">
+                                            {{ service_info.service.url }}
+                                        </a>
+                                    </td>
+                                    <td>
+                                        <span class="badge bg-success">{{ service_info.access_type }}</span>
+                                    </td>
+                                    <td>
+                                        <span class="badge bg-info">{{ service_info.access_method }}</span>
+                                        {% if service_info.group_name %}
+                                        <br><small>{{ service_info.group_name }}</small>
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        {% if service_info.granted_at %}
+                                        {{ service_info.granted_at|date:"M d, Y H:i" }}
+                                        {% else %}
+                                        -
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        {% if service_info.expires_at %}
+                                        {{ service_info.expires_at|date:"M d, Y H:i" }}
+                                        {% else %}
+                                        Never
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        <a href="{% url 'cas:token_login' %}?service={{ service_info.service.url|urlencode }}"
+                                            class="btn btn-sm btn-primary">
+                                            Access Service
+                                        </a>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <div class="alert alert-warning">
+                        <strong>No services available.</strong> Contact an administrator to request access to services.
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row mt-4">
+        <!-- Recent Activity -->
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <h5>Recent Activity</h5>
+                </div>
+                <div class="card-body">
+                    {% if recent_logs %}
+                    <div class="table-responsive">
+                        <table class="table table-sm">
+                            <thead>
+                                <tr>
+                                    <th>Action</th>
+                                    <th>IP Address</th>
+                                    <th>Success</th>
+                                    <th>Time</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for log in recent_logs %}
+                                <tr>
+                                    <td>{{ log.action }}</td>
+                                    <td>{{ log.ip_address }}</td>
+                                    <td>
+                                        {% if log.success %}
+                                        <span class="badge bg-success">Success</span>
+                                        {% else %}
+                                        <span class="badge bg-danger">Failed</span>
+                                        {% endif %}
+                                    </td>
+                                    <td>{{ log.created_at|date:"M d, Y H:i:s" }}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <p class="text-muted">No recent activity.</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    function copyToClipboard(elementId) {
+        const element = document.getElementById(elementId);
+        element.select();
+        element.setSelectionRange(0, 99999); // For mobile devices
+        document.execCommand('copy');
+
+        // Show feedback
+        const button = event.target;
+        const originalText = button.textContent;
+        button.textContent = 'Copied!';
+        button.classList.add('btn-success');
+        button.classList.remove('btn-outline-secondary');
+
+        setTimeout(() => {
+            button.textContent = originalText;
+            button.classList.remove('btn-success');
+            button.classList.add('btn-outline-secondary');
+        }, 2000);
+    }
+
+    // Service-specific token system - tokens are generated per service access
+</script>
+{% endblock %}
