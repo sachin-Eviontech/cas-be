@@ -9,7 +9,7 @@
             <div class="d-flex justify-content-between align-items-center mb-4">
                 <h2>Token Dashboard</h2>
                 <div>
-                    <a href="{% url 'cas:token_logout' %}" class="btn btn-outline-danger">Logout</a>
+                    <a href="{% url 'cas:logout' %}" class="btn btn-outline-danger">Logout</a>
                 </div>
             </div>
         </div>
@@ -112,7 +112,7 @@
                                         {% endif %}
                                     </td>
                                     <td>
-                                        <a href="{% url 'cas:token_login' %}?service={{ service_info.service.url|urlencode }}"
+                                        <a href="{% url 'cas:login' %}?service={{ service_info.service.url|urlencode }}"
                                             class="btn btn-sm btn-primary">
                                             Access Service
                                         </a>
