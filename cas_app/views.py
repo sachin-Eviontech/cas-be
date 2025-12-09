@@ -1,132 +1,149 @@
 from django.shortcuts import render, redirect
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
-from django.http import JsonResponse, HttpResponse
+from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from django.utils import timezone
 from django.conf import settings
-from django.urls import reverse
 from django.contrib import messages
 from django.utils.decorators import method_decorator
 from django.views.generic import TemplateView
-from django.core.exceptions import ObjectDoesNotExist
+from .models import AuthenticationLog, UserProfile
+from .token_utils import generate_service_tokens, check_user_service_access_by_url
+from .utils import get_client_ip, check_user_service_access
 import json
 import logging
-from datetime import timedelta
-from .models import (
-    Service, Ticket, ProxyGrantingTicket, AuthenticationLog, UserProfile,
-    UserServiceAccess, ServiceGroup, UserGroupAccess
-)
-from .utils import (
-    get_client_ip, generate_ticket_id, validate_service_url,
-    check_user_service_access, get_user_accessible_services
-)
 
 logger = logging.getLogger('cas_app')
 
 
-def cas_root(request):
-    """Root CAS URL - redirect to login or dashboard based on authentication status"""
-    if request.user.is_authenticated:
-        return redirect('cas:dashboard')
-    else:
-        return redirect('cas:login')
-
-
-class CASLoginView(TemplateView):
-    """CAS Login page"""
-    template_name = 'cas/login.html'
+class TokenLoginView(TemplateView):
+    """Token-based login page"""
+    template_name = 'login.html'
     
     def get(self, request, *args, **kwargs):
-        service = request.GET.get('service', '')
-        if service and not validate_service_url(service):
-            return render(request, 'cas/error.html', {
-                'error': 'Invalid service URL',
-                'service': service
+        service_url = request.GET.get('service', '')
+        
+        # Service parameter is mandatory for token-based login
+        if not service_url:
+            messages.error(request, 'Service parameter is required for token-based login')
+            return render(request, self.template_name, {
+                'service': service_url,
+                'next': request.GET.get('next', ''),
+                'error': 'Service parameter is required'
             })
         
         if request.user.is_authenticated:
-            if service:
-                return redirect(f"{settings.CAS_LOGIN_URL}?service={service}")
-            return redirect('cas:dashboard')
+            # Check service access and redirect with token
+            has_access, access_message, service = check_user_service_access_by_url(request.user, service_url)
+            if has_access:
+                # Generate service-specific tokens
+                access_token, refresh_token = generate_service_tokens(request.user, service)
+                return redirect(f"{service_url}?token={access_token}")
+            else:
+                messages.error(request, f'Access denied: {access_message}')
+                return render(request, self.template_name, {'service': service_url})
         
         return render(request, self.template_name, {
-            'service': service,
+            'service': service_url,
             'next': request.GET.get('next', '')
         })
     
     def post(self, request, *args, **kwargs):
         username = request.POST.get('username')
         password = request.POST.get('password')
-        service = request.POST.get('service', '')
+        service_url = request.POST.get('service', '')
         remember_me = request.POST.get('remember_me', False)
         
         if not username or not password:
             messages.error(request, 'Username and password are required.')
-            return render(request, self.template_name, {'service': service})
+            return render(request, self.template_name, {'service': service_url})
+        
+        # Service parameter is mandatory
+        if not service_url:
+            messages.error(request, 'Service parameter is required.')
+            return render(request, self.template_name, {'service': service_url})
         
         user = authenticate(request, username=username, password=password)
         if user is not None:
             if user.is_active:
+                # Check service access BEFORE login
+                has_access, access_message, service = check_user_service_access_by_url(user, service_url)
+                if not has_access:
+                    # Log failed access attempt
+                    AuthenticationLog.objects.create(
+                        user=user,
+                        action='token_web_login_access_denied',
+                        ip_address=get_client_ip(request),
+                        user_agent=request.META.get('HTTP_USER_AGENT', ''),
+                        success=False,
+                        details=f'{{"service": "{service_url}", "reason": "{access_message}"}}'
+                    )
+                    messages.error(request, f'Access denied: {access_message}')
+                    return render(request, self.template_name, {'service': service_url})
+                
                 login(request, user)
                 
-                # Log authentication
+                # Log successful authentication
                 AuthenticationLog.objects.create(
                     user=user,
-                    action='login',
+                    service=service,
+                    action='token_web_login',
                     ip_address=get_client_ip(request),
                     user_agent=request.META.get('HTTP_USER_AGENT', ''),
                     success=True
                 )
                 
-                if service:
-                    # Check if user has access to this service
-                    has_access, access_message = check_user_service_access(user, service)
-                    if not has_access:
-                        messages.error(request, f'Access denied: {access_message}')
-                        return render(request, self.template_name, {'service': service})
-                    
-                    # Generate service ticket
-                    service_obj = Service.objects.filter(url=service, is_active=True).first()
-                    if service_obj:
-                        ticket = Ticket.objects.create(
-                            ticket_type='ST',
-                            user=user,
-                            service=service_obj,
-                            expires_at=timezone.now() + timedelta(minutes=5)
-                        )
-                        return redirect(f"{service}?ticket={ticket.ticket_id}")
-                    else:
-                        messages.error(request, 'Service not registered or inactive.')
-                        return render(request, self.template_name, {'service': service})
-                else:
-                    return redirect('cas:dashboard')
+                # Generate service-specific token and redirect
+                access_token, refresh_token = generate_service_tokens(user, service)
+                return redirect(f"{service_url}?token={access_token}")
             else:
                 messages.error(request, 'Account is disabled.')
         else:
             # Log failed authentication
             AuthenticationLog.objects.create(
-                action='login',
+                action='token_web_login',
                 ip_address=get_client_ip(request),
                 user_agent=request.META.get('HTTP_USER_AGENT', ''),
                 success=False,
-                details='{"username": "' + username + '"}'
+                details='{"username": "' + username + '", "service": "' + service_url + '"}'
             )
             messages.error(request, 'Invalid username or password.')
         
-        return render(request, self.template_name, {'service': service})
+        return render(request, self.template_name, {'service': service_url})
 
 
 @login_required
-def cas_logout(request):
-    """CAS Logout"""
+def token_dashboard(request):
+    """Token-based dashboard - shows available services"""
+    user_profile, created = UserProfile.objects.get_or_create(user=request.user)
+    
+    # Get accessible services (no tokens needed, just user-based)
+    from .token_utils import get_user_accessible_services_by_token
+    accessible_services = get_user_accessible_services_by_token(None, user=request.user)
+    
+    # Get recent authentication logs
+    recent_logs = AuthenticationLog.objects.filter(user=request.user).order_by('-created_at')[:10]
+    
+    context = {
+        'user_profile': user_profile,
+        'accessible_services': accessible_services,
+        'recent_logs': recent_logs,
+    }
+    
+    return render(request, 'token_dashboard.html', context)
+
+
+@login_required
+def token_logout(request):
+    """Token-based logout"""
     service = request.GET.get('service', '')
     
     # Log logout
     AuthenticationLog.objects.create(
         user=request.user,
-        action='logout',
+        action='token_web_logout',
         ip_address=get_client_ip(request),
         user_agent=request.META.get('HTTP_USER_AGENT', ''),
         success=True
@@ -139,89 +156,163 @@ def cas_logout(request):
     return redirect('cas:login')
 
 
-@login_required
-def cas_dashboard(request):
-    """CAS Dashboard for authenticated users"""
-    user_profile, created = UserProfile.objects.get_or_create(user=request.user)
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def token_validate_web(request):
+    """Service-specific token validation endpoint for web services"""
+    if request.method == 'GET':
+        token = request.GET.get('token')
+        service_url = request.GET.get('service')
+    else:
+        try:
+            data = json.loads(request.body)
+            token = data.get('token')
+            service_url = data.get('service')
+        except json.JSONDecodeError:
+            return JsonResponse({
+                'success': False,
+                'error': 'Invalid JSON data'
+            }, status=400)
     
-    # Get recent tickets
-    recent_tickets = Ticket.objects.filter(user=request.user).order_by('-created_at')[:10]
+    if not token:
+        return JsonResponse({
+            'success': False,
+            'error': 'Token parameter is required'
+        }, status=400)
     
-    # Get recent authentication logs
-    recent_logs = AuthenticationLog.objects.filter(user=request.user).order_by('-created_at')[:10]
+    if not service_url:
+        return JsonResponse({
+            'success': False,
+            'error': 'Service parameter is required'
+        }, status=400)
     
-    # Get accessible services
-    accessible_services = get_user_accessible_services(request.user)
+    from .token_utils import validate_service_token
     
-    # Get pending access requests
-    pending_requests = UserServiceAccess.objects.filter(
-        user=request.user,
-        access_type='PENDING',
-        is_active=True
-    ).order_by('-created_at')
+    # Validate service-specific token
+    is_valid, user, service, message = validate_service_token(token, service_url)
     
-    context = {
-        'user_profile': user_profile,
-        'recent_tickets': recent_tickets,
-        'recent_logs': recent_logs,
-        'accessible_services': accessible_services,
-        'pending_requests': pending_requests,
+    if not is_valid:
+        # Log failed validation
+        AuthenticationLog.objects.create(
+            user=user,  # May be None if token is completely invalid
+            action='token_web_validate_failed',
+            ip_address=get_client_ip(request),
+            user_agent=request.META.get('HTTP_USER_AGENT', ''),
+            success=False,
+            details=f'{{"service": "{service_url}", "reason": "{message}"}}'
+        )
+        
+        return JsonResponse({
+            'success': False,
+            'error': message,
+            'service_url': service_url
+        }, status=401)
+    
+    # Log successful validation
+    AuthenticationLog.objects.create(
+        user=user,
+        service=service,
+        action='token_web_validate',
+        ip_address=get_client_ip(request),
+        user_agent=request.META.get('HTTP_USER_AGENT', ''),
+        success=True
+    )
+    
+    response_data = {
+        'success': True,
+        'user': user.username,
+        'service': {
+            'id': service.id,
+            'name': service.name,
+            'url': service.url,
+            'description': service.description
+        },
+        'attributes': {
+            'username': user.username,
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'is_active': user.is_active,
+            'date_joined': user.date_joined.isoformat() if user.date_joined else None
+        }
     }
     
-    return render(request, 'cas/dashboard.html', context)
+    return JsonResponse(response_data)
 
 
-@csrf_exempt
-@require_http_methods(["GET", "POST"])
-def cas_validate(request):
-    """CAS Service Validation endpoint"""
-    if request.method == 'GET':
-        ticket = request.GET.get('ticket')
-        service = request.GET.get('service')
-        pgt_url = request.GET.get('pgtUrl')
-    else:
-        data = json.loads(request.body)
-        ticket = data.get('ticket')
-        service = data.get('service')
-        pgt_url = data.get('pgtUrl')
+from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from django.contrib.auth import authenticate, login, logout
+from django.utils import timezone
+from .models import AuthenticationLog
+from .token_utils import (
+    generate_service_tokens, verify_token, validate_service_token,
+    check_user_service_access_by_url, get_user_accessible_services_by_token,
+    refresh_service_access_token, get_user_attributes_from_token
+)
+from .utils import get_client_ip
+from .serializers import LoginRequestSerializer
+import logging
+
+logger = logging.getLogger('cas_app')
+
+
+@api_view(['POST'])
+@permission_classes([])
+def token_login(request):
+    """
+    Service-specific login and get JWT tokens
+    Service parameter is REQUIRED
+    """
+    serializer = LoginRequestSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
-    if not ticket or not service:
-        return JsonResponse({
-            'error': 'ticket and service parameters are required'
-        }, status=400)
+    username = serializer.validated_data['username']
+    password = serializer.validated_data['password']
+    service_url = serializer.validated_data.get('service')
+    remember_me = serializer.validated_data.get('remember_me', False)
     
-    try:
-        ticket_obj = Ticket.objects.get(ticket_id=ticket, is_valid=True)
+    # Service parameter is mandatory
+    if not service_url:
+        return Response({
+            'success': False,
+            'message': 'Service parameter is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    user = authenticate(request, username=username, password=password)
+    if user is not None and user.is_active:
+        # Check if user has access to the requested service BEFORE generating tokens
+        has_access, access_message, service = check_user_service_access_by_url(user, service_url)
+        if not has_access:
+            # Log failed access attempt
+            AuthenticationLog.objects.create(
+                user=user,
+                action='token_login_access_denied',
+                ip_address=get_client_ip(request),
+                user_agent=request.META.get('HTTP_USER_AGENT', ''),
+                success=False,
+                details=f'{{"service": "{service_url}", "reason": "{access_message}"}}'
+            )
+            
+            return Response({
+                'success': False,
+                'message': f'Access denied to service: {access_message}',
+                'service_url': service_url
+            }, status=status.HTTP_403_FORBIDDEN)
         
-        # Check if ticket is expired
-        if ticket_obj.is_expired():
-            ticket_obj.is_valid = False
-            ticket_obj.save()
-            return JsonResponse({
-                'error': 'ticket has expired'
-            }, status=400)
+        login(request, user)
         
-        # Check if ticket is already used
-        if ticket_obj.is_used:
-            return JsonResponse({
-                'error': 'ticket has already been used'
-            }, status=400)
+        # Generate service-specific JWT tokens
+        access_token, refresh_token = generate_service_tokens(user, service)
         
-        # Validate service
-        if not validate_service_url(service):
-            return JsonResponse({
-                'error': 'invalid service URL'
-            }, status=400)
-        
-        # Mark ticket as used
-        ticket_obj.is_used = True
-        ticket_obj.save()
-        
-        # Log validation
+        # Log successful authentication
         AuthenticationLog.objects.create(
-            user=ticket_obj.user,
-            service=ticket_obj.service,
-            action='validate',
+            user=user,
+            service=service,
+            action='token_login',
             ip_address=get_client_ip(request),
             user_agent=request.META.get('HTTP_USER_AGENT', ''),
             success=True
@@ -229,173 +320,293 @@ def cas_validate(request):
         
         response_data = {
             'success': True,
-            'user': ticket_obj.user.username,
-            'attributes': {
-                'username': ticket_obj.user.username,
-                'email': ticket_obj.user.email,
-                'first_name': ticket_obj.user.first_name,
-                'last_name': ticket_obj.user.last_name,
-            }
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'token_type': 'Bearer',
+            'expires_in': 3600,  # 1 hour
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name
+            },
+            'service': {
+                'id': service.id,
+                'name': service.name,
+                'url': service.url,
+                'description': service.description
+            },
+            'message': 'Login successful and tokens generated for service'
         }
         
-        # Handle PGT if provided
-        if pgt_url:
-            pgt = ProxyGrantingTicket.objects.create(
-                user=ticket_obj.user,
-                expires_at=timezone.now() + timedelta(hours=2)
-            )
-            response_data['pgt'] = pgt.pgt_id
-        
-        return JsonResponse(response_data)
-        
-    except Ticket.DoesNotExist:
-        return JsonResponse({
-            'error': 'invalid ticket'
-        }, status=400)
-    except Exception as e:
-        logger.error(f"Error validating ticket: {str(e)}")
-        return JsonResponse({
-            'error': 'internal server error'
-        }, status=500)
-
-
-@csrf_exempt
-@require_http_methods(["GET", "POST"])
-def cas_proxy_validate(request):
-    """CAS Proxy Validation endpoint"""
-    if request.method == 'GET':
-        ticket = request.GET.get('ticket')
-        service = request.GET.get('service')
-        pgt_url = request.GET.get('pgtUrl')
+        return Response(response_data, status=status.HTTP_200_OK)
     else:
-        data = json.loads(request.body)
-        ticket = data.get('ticket')
-        service = data.get('service')
-        pgt_url = data.get('pgtUrl')
-    
-    if not ticket or not service:
-        return JsonResponse({
-            'error': 'ticket and service parameters are required'
-        }, status=400)
-    
-    try:
-        ticket_obj = Ticket.objects.get(ticket_id=ticket, ticket_type='PT', is_valid=True)
-        
-        # Check if ticket is expired
-        if ticket_obj.is_expired():
-            ticket_obj.is_valid = False
-            ticket_obj.save()
-            return JsonResponse({
-                'error': 'ticket has expired'
-            }, status=400)
-        
-        # Check if ticket is already used
-        if ticket_obj.is_used:
-            return JsonResponse({
-                'error': 'ticket has already been used'
-            }, status=400)
-        
-        # Validate service
-        if not validate_service_url(service):
-            return JsonResponse({
-                'error': 'invalid service URL'
-            }, status=400)
-        
-        # Mark ticket as used
-        ticket_obj.is_used = True
-        ticket_obj.save()
-        
-        # Log validation
+        # Log failed authentication
         AuthenticationLog.objects.create(
-            user=ticket_obj.user,
-            service=ticket_obj.service,
-            action='proxy_validate',
+            action='token_login',
             ip_address=get_client_ip(request),
             user_agent=request.META.get('HTTP_USER_AGENT', ''),
-            success=True
+            success=False,
+            details='{"username": "' + username + '", "service": "' + (service_url or 'none') + '"}'
         )
         
-        response_data = {
-            'success': True,
-            'user': ticket_obj.user.username,
-            'proxies': [],  # Add proxy chain if needed
-            'attributes': {
-                'username': ticket_obj.user.username,
-                'email': ticket_obj.user.email,
-                'first_name': ticket_obj.user.first_name,
-                'last_name': ticket_obj.user.last_name,
-            }
+        return Response({
+            'success': False,
+            'message': 'Invalid credentials'
+        }, status=status.HTTP_401_UNAUTHORIZED)
+
+
+@api_view(['POST'])
+@permission_classes([])
+def token_refresh(request):
+    """
+    Refresh service-specific access token using refresh token
+    """
+    refresh_token = request.data.get('refresh_token')
+    if not refresh_token:
+        return Response({
+            'success': False,
+            'message': 'Refresh token is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    access_token, message = refresh_service_access_token(refresh_token)
+    if access_token:
+        # Get service info from the new token for response
+        payload = verify_token(access_token)
+        service_info = {
+            'id': payload.get('service_id'),
+            'name': payload.get('service_name'),
+            'url': payload.get('service_url')
         }
         
-        return JsonResponse(response_data)
-        
-    except Ticket.DoesNotExist:
-        return JsonResponse({
-            'error': 'invalid ticket'
-        }, status=400)
-    except Exception as e:
-        logger.error(f"Error validating proxy ticket: {str(e)}")
-        return JsonResponse({
-            'error': 'internal server error'
-        }, status=500)
+        return Response({
+            'success': True,
+            'access_token': access_token,
+            'token_type': 'Bearer',
+            'expires_in': 3600,
+            'service': service_info,
+            'message': message
+        }, status=status.HTTP_200_OK)
+    else:
+        return Response({
+            'success': False,
+            'message': message
+        }, status=status.HTTP_401_UNAUTHORIZED)
 
 
-def cas_service_validate(request):
-    """CAS Service Validation (XML response)"""
-    ticket = request.GET.get('ticket')
-    service = request.GET.get('service')
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def token_logout(request):
+    """
+    Logout and invalidate tokens (client-side token removal)
+    """
+    # Log logout
+    AuthenticationLog.objects.create(
+        user=request.user,
+        action='token_logout',
+        ip_address=get_client_ip(request),
+        user_agent=request.META.get('HTTP_USER_AGENT', ''),
+        success=True
+    )
     
-    if not ticket or not service:
-        return HttpResponse(
-            '<?xml version="1.0"?>\n<cas:serviceResponse xmlns:cas="http://www.yale.edu/tp/cas">\n'
-            '<cas:authenticationFailure code="INVALID_REQUEST">ticket and service parameters are required</cas:authenticationFailure>\n'
-            '</cas:serviceResponse>',
-            content_type='application/xml'
-        )
+    logout(request)
     
-    try:
-        ticket_obj = Ticket.objects.get(ticket_id=ticket, is_valid=True)
-        
-        if ticket_obj.is_expired() or ticket_obj.is_used:
-            return HttpResponse(
-                '<?xml version="1.0"?>\n<cas:serviceResponse xmlns:cas="http://www.yale.edu/tp/cas">\n'
-                '<cas:authenticationFailure code="INVALID_TICKET">ticket has expired or been used</cas:authenticationFailure>\n'
-                '</cas:serviceResponse>',
-                content_type='application/xml'
-            )
-        
-        # Mark ticket as used
-        ticket_obj.is_used = True
-        ticket_obj.save()
-        
-        # Log validation
+    return Response({
+        'success': True,
+        'message': 'Logout successful'
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([])
+def token_validate(request):
+    """
+    Validate service-specific token
+    Both token and service parameters are REQUIRED
+    """
+    token = request.data.get('token')
+    service_url = request.data.get('service')
+    
+    if not token:
+        return Response({
+            'success': False,
+            'message': 'Token is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    if not service_url:
+        return Response({
+            'success': False,
+            'message': 'Service parameter is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Validate service-specific token
+    is_valid, user, service, message = validate_service_token(token, service_url)
+    
+    if not is_valid:
+        # Log failed validation
         AuthenticationLog.objects.create(
-            user=ticket_obj.user,
-            service=ticket_obj.service,
-            action='service_validate',
+            user=user,  # May be None if token is completely invalid
+            action='token_validate_failed',
             ip_address=get_client_ip(request),
             user_agent=request.META.get('HTTP_USER_AGENT', ''),
-            success=True
+            success=False,
+            details=f'{{"service": "{service_url}", "reason": "{message}"}}'
         )
         
-        xml_response = f'''<?xml version="1.0"?>
-<cas:serviceResponse xmlns:cas="http://www.yale.edu/tp/cas">
-    <cas:authenticationSuccess>
-        <cas:user>{ticket_obj.user.username}</cas:user>
-        <cas:attributes>
-            <cas:email>{ticket_obj.user.email or ''}</cas:email>
-            <cas:firstName>{ticket_obj.user.first_name or ''}</cas:firstName>
-            <cas:lastName>{ticket_obj.user.last_name or ''}</cas:lastName>
-        </cas:attributes>
-    </cas:authenticationSuccess>
-</cas:serviceResponse>'''
-        
-        return HttpResponse(xml_response, content_type='application/xml')
-        
-    except Ticket.DoesNotExist:
-        return HttpResponse(
-            '<?xml version="1.0"?>\n<cas:serviceResponse xmlns:cas="http://www.yale.edu/tp/cas">\n'
-            '<cas:authenticationFailure code="INVALID_TICKET">ticket not found</cas:authenticationFailure>\n'
-            '</cas:serviceResponse>',
-            content_type='application/xml'
-        )
+        return Response({
+            'success': False,
+            'message': message,
+            'service_url': service_url
+        }, status=status.HTTP_401_UNAUTHORIZED)
+    
+    # Log successful validation
+    AuthenticationLog.objects.create(
+        user=user,
+        service=service,
+        action='token_validate',
+        ip_address=get_client_ip(request),
+        user_agent=request.META.get('HTTP_USER_AGENT', ''),
+        success=True
+    )
+    
+    response_data = {
+        'success': True,
+        'user': user.username,
+        'service': {
+            'id': service.id,
+            'name': service.name,
+            'url': service.url,
+            'description': service.description
+        },
+        'attributes': {
+            'username': user.username,
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'is_active': user.is_active
+        },
+        'message': message
+    }
+    
+    return Response(response_data, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([])
+def token_user_info(request):
+    """
+    Get user information from service-specific token
+    Both token and service parameters are REQUIRED
+    """
+    token = request.data.get('token')
+    service_url = request.data.get('service')
+    
+    if not token:
+        return Response({
+            'success': False,
+            'message': 'Token is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    if not service_url:
+        return Response({
+            'success': False,
+            'message': 'Service parameter is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Validate service-specific token
+    is_valid, user, service, message = validate_service_token(token, service_url)
+    
+    if not is_valid:
+        return Response({
+            'success': False,
+            'message': message
+        }, status=status.HTTP_401_UNAUTHORIZED)
+    
+    return Response({
+        'success': True,
+        'user': {
+            'id': user.id,
+            'username': user.username,
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'is_active': user.is_active
+        },
+        'service': {
+            'id': service.id,
+            'name': service.name,
+            'url': service.url,
+            'description': service.description
+        },
+        'attributes': {
+            'username': user.username,
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'is_active': user.is_active,
+            'date_joined': user.date_joined.isoformat() if user.date_joined else None
+        }
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([])
+def get_user_services(request):
+    """
+    Get all services that a user has access to
+    Requires valid credentials (not token-based)
+    """
+    username = request.data.get('username')
+    password = request.data.get('password')
+    
+    if not username or not password:
+        return Response({
+            'success': False,
+            'message': 'Username and password are required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    user = authenticate(request, username=username, password=password)
+    if not user or not user.is_active:
+        return Response({
+            'success': False,
+            'message': 'Invalid credentials'
+        }, status=status.HTTP_401_UNAUTHORIZED)
+    
+    # Get accessible services using the token utility
+    accessible_services = get_user_accessible_services_by_token(None, user=user)
+    
+    services_data = []
+    for service_info in accessible_services:
+        service_data = {
+            'id': service_info['service'].id,
+            'name': service_info['service'].name,
+            'url': service_info['service'].url,
+            'description': service_info['service'].description,
+            'access_type': service_info['access_type'],
+            'access_method': service_info['access_method'],
+            'granted_at': service_info['granted_at'].isoformat() if service_info['granted_at'] else None,
+            'expires_at': service_info['expires_at'].isoformat() if service_info['expires_at'] else None
+        }
+        if 'group_name' in service_info:
+            service_data['group_name'] = service_info['group_name']
+        services_data.append(service_data)
+    
+    return Response({
+        'success': True,
+        'user': {
+            'id': user.id,
+            'username': user.username,
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name
+        },
+        'accessible_services': services_data,
+        'count': len(services_data)
+    }, status=status.HTTP_200_OK)
+
+
+
+def logout_view(request):
+    logout(request)
+    return redirect('cas:login')
